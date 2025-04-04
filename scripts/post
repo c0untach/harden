@@ -1,0 +1,17 @@
+function f_post {
+  if [[ $LXC == "1" ]]; then
+    return
+  fi
+
+  echo "[!] Post processing"
+
+  $APT install --no-install-recommends fwupd
+
+  if [[ $VERBOSE == "Y" ]]; then
+    update-grub
+  else
+    update-grub 2>/dev/null
+  fi
+
+  find /boot/ -type f -name '*.cfg' -exec chmod 0400 {} \;
+}

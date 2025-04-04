@@ -1,0 +1,12 @@
+function f_disablefs {
+  echo "[!] Disable misc file systems"
+
+  local FS
+  FS="cramfs freevxfs jffs2 ksmbd hfs hfsplus udf"
+  for disable in $FS; do
+    if ! grep -q "$disable" "$DISABLEFS" 2> /dev/null; then
+      echo "install $disable /bin/true" >> "$DISABLEFS"
+    fi
+  done
+
+}

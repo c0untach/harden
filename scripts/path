@@ -1,0 +1,10 @@
+function f_path {
+  echo "[!] Modifying paths"
+
+  sed -i 's/PATH=.*/PATH=\"\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/bin:\/snap\/bin"/' /etc/environment
+  cp ./config/initpath.sh /etc/profile.d/initpath.sh
+
+  chown root:root /etc/profile.d/initpath.sh
+  chmod 0644 /etc/profile.d/initpath.sh
+
+}

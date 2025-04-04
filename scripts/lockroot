@@ -1,0 +1,11 @@
+function f_lockroot {
+  echo "[!] Lock root account"
+
+  #usermod -L root
+
+  #if [[ $VERBOSE == "Y" ]]; then
+  #  passwd -S root
+  #  echo
+  #fi
+
+}

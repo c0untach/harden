@@ -1,0 +1,21 @@
+function f_rootaccess {
+  echo "[!] Root access"
+
+  if ! grep -E '^+\s:\sroot\s:\s127.0.0.1$|^:root:127.0.0.1' "$SECURITYACCESS"; then
+    sed -i 's/^#.*root.*:.*127.0.0.1$/+:root:127.0.0.1/' "$SECURITYACCESS"
+  fi
+
+  echo "console" > /etc/securetty
+
+  echo "[!] Mask debug-shell"
+
+  systemctl mask debug-shell.service
+  systemctl stop debug-shell.service
+  systemctl daemon-reload
+
+  if [[ $VERBOSE == "Y" ]]; then
+    systemctl status debug-shell.service --no-pager
+    echo
+  fi
+
+}

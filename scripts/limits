@@ -1,0 +1,17 @@
+function f_limitsconf {
+  echo "[!] $LIMITSCONF"
+
+  sed -i 's/^# End of file*//' "$LIMITSCONF"
+  { echo '* hard maxlogins 10'
+    echo '* hard core 0'
+    echo '* soft nproc 512'
+    echo '* hard nproc 1024'
+    echo '# End of file'
+  } >> "$LIMITSCONF"
+
+  if [[ $VERBOSE == "Y" ]]; then
+    grep -v '#' "$LIMITSCONF" | uniq
+    echo
+  fi
+
+}
