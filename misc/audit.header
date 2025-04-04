@@ -1,0 +1,11 @@
+# Remove any existing rules
+-D
+
+# Buffer Size
+-b 8192
+
+# Report errors
+-c
+
+# Failure Mode
+-f 2
