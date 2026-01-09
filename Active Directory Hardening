@@ -1,0 +1,951 @@
+# AD_hardening
+
+## ## 🎄 Advent of AD-Hardening #1: Deactivate NTLMv1 and LM
+
+If your AD still allows LM or NTLMv1, you’re basically keeping a side door open "just in case it’s 1999 again" ;)
+These protocols are ancient, weak, and exactly what attackers love for pass-the-hash and NTLM relay shenanigans.
+
+Why this matters (in attacker terms):
+LM/NTLMv1 hashes are easier to crack, replay, and relay. If they exist in your environment, they lower the bar for lateral movement a lot. 
+
+Turning them off removes a whole class of cheap wins.
+GPO: Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options
+
+- Network security: LAN Manager authentication level
+ ✅ Set to: “Send NTLMv2 only. Refuse LM & NTLM”
+ → This forces modern NTLMv2 and blocks the old stuff.
+
+- Network security: Do not store LAN Manager hash value
+ ✅ Enabled
+ → Prevents LM hashes from being generated/stored going forward.
+
+- Network security: Restrict NTLM…
+ ✅ Audit first, then Deny
+ → Start with auditing so you see who/what still depends on NTLM, then lock it down step by step.
+
+Caveats / rollout reality check:
+Old NAS boxes, printers, scanners, legacy apps, ancient anything might freak out, so don’t go "deny all" blind. 
+
+Audit for a while, identify offenders, fix/replace them, then deny.
+Expect a few surprises in weird corners like service accounts, scheduled tasks, or old management tools.
+
+Do this now (quick checklist):
+- Roll out the two LM/NTLMv1 settings to a pilot OU first.
+- Enable NTLM restriction auditing and watch the logs for a week or two.
+- Track offenders → fix config / update software / replace devices.
+- Only then switch Restrict NTLM from Audit → Deny.
+- Celebrate because you just removed a classic lateral-movement highway.
+
+Attackers hate this one simple GPO. 😄
+
+
+## 🎄 Advent of AD-Hardening #2: Deactivate Print Spooler on DCs
+
+Domain Controllers shouldn’t be printing... like... ever.
+
+If a DC is running the Print Spooler, you’re basically volunteering it for an entire zoo of "spooler-to-SYSTEM-to-domain-admin" bugs. 
+PrintNightmare was the headline act, but it’s not the only one.
+
+Why this matters:
+The spooler service has a long history of privilege escalation and remote code execution issues. On a DC that’s basically "press button, receive takeover".
+
+Turning it off removes that attack surface completely.
+
+GPO setting (DC policy):
+ Computer Configuration → Policies → Windows Settings → Security Settings → System Services
+Print Spooler = Disabled
+
+→ Service won’t start, remote spooler endpoints go dark. Nice.
+
+Caveats / reality check:
+If you (for some reason) use DCs as print servers or host printer shares on them: stop that first. Move printing to dedicated servers.
+Disabling spooler on DCs does not affect normal printing from clients or print servers. It only affects the DCs themselves.
+
+In rare legacy setups, some GPP printer deployment or old scripts might reference a DC share. Fix those references, then disable.
+
+Do this now:
+- Verify spooler status on all DCs:
+Get-Service Spooler -ComputerName (Get-ADDomainController -Filter *).HostName
+- Make/adjust a DC-only GPO with Print Spooler = Disabled.
+- Link it to the Domain Controllers OU (not your whole domain).
+
+After rollout, double-check:
+ sc.exe \\DCNAME query spooler → should be STOPPED / disabled.
+
+If something breaks, that’s your signal you had printing where it never belonged. Move it, then re-disable.
+
+This is one of those “low effort, high payoff” hardenings. Attackers lose a favorite ladder, and you lose nothing you should be relying on anyway. 😄
+
+
+## ## 🎄 Advent of AD-Hardening #3: Deactivate LLMNR / NBT-NS
+
+LLMNR and NetBIOS name resolution are like that "helpful" colleague who answers other people’s emails… with the wrong info. 
+Attackers love them because they can poison name lookups and then relay creds faster than you can say "Responder.py".
+
+Why this matters (Responder-style attacks in 15 seconds):
+If a client can’t resolve a name via DNS, it may fall back to LLMNR/NBT-NS and shout "who is FILESERVER?" into the network. 
+An attacker replies "me!", grabs the NTLM hash, and either cracks or relays it. 
+
+Special voice: Yeah... We don't do that here.
+
+1) Disable LLMNR
+GPO path:
+ Computer Configuration → Policies → Administrative Templates → Network → DNS Client
+Turn off multicast name resolution = Enabled
+ → Kills LLMNR fallback completely.
+
+2) Disable NetBIOS / NBT-NS
+You can push this cleanly via GPP Registry:
+GPO path:
+Computer Configuration → Preferences → Windows Settings → Registry
+Create/Update value:
+Hive: HKEY_LOCAL_MACHINE
+Key Path: SYSTEM\CurrentControlSet\Services\Dnscache\Parameters
+Value name: EnableNetbios
+Type: REG_DWORD
+Value data: 0
+(Options: don’t stop processing on error, don’t remove when no longer applied, not one-time.)
+
+Caveats / rollout reality check:
+- Old stuff may rely on NetBIOS: ancient scanners/printers, legacy SMB browsing, weird ERP clients, WINS-era leftovers. Please burn it.
+- Disabling these can reveal DNS hygiene problems you didn’t know you had. That’s a good thing, but expect a bit of cleanup.
+Do it in phases: pilot OU → broader rollout → monitor tickets.
+
+Do this now (quick checklist):
+- Enable LLMNR off in a pilot OU first.
+- Roll out the NetBIOS registry setting to the same pilot.
+- Watch for devices/apps that suddenly “can’t find server XYZ”.
+- Fix root cause (DNS records, decommission legacy, proper FQDN use).
+- Then push domain-wide.
+
+Turning off LLMNR/NBT-NS is one of those changes that quietly removes an attacker’s favorite party trick. Less noise, fewer relays, happier blue team. 😄
+
+Extra bonus points if you found the Marvel-reference in that post. Here's your christmas cookie: 🍪 
+
+
+## ## 🎄 Advent of AD-Hardening #4: MachineAccountQuota = 0
+
+Default AD behavior is kind of wild: any authenticated user can join up to 10 computers to the domain. That’s MachineAccountQuota.
+
+Attackers love it because it lets them mint fresh computer accounts that look legit, then use those accounts for pivoting and privilege games.
+
+Why this matters (attacker view):
+A low-priv user creates a computer object → that computer lands in Domain Computers → inherits whatever rights that group has.
+
+If "Domain Computers" is over-privileged (sadly common), that new box account becomes a stealthy foothold for escalation and lateral movement. Think “bring your own computer account.”
+
+What to change:
+1) Set ms-DS-MachineAccountQuota to 0
+That means: no more domain joins by random users. Only people/services you explicitly delegate can add machines.
+
+PowerShell (quick + clean):
+Run as Domain Admin:
+Set-ADDomain -Identity (Get-ADDomain) -Replace @{"ms-DS-MachineAccountQuota"=0}
+
+Verify:
+(Get-ADDomain).ms-DS-MachineAccountQuota
+(ADUC/ADSIEdit works too, but PowerShell is fastest and least clicky.)
+
+2) Make sure Domain Computers isn’t privileged
+This is the "don’t leave gasoline next to the candle" part.
+- Domain Computers should NOT be a member of privileged groups
+ (Account Operators, Server Operators, custom admin groups, etc.)
+- Domain Computers should NOT have write rights on AD objects
+ If it can write to OUs or GPOs, a fake computer account can abuse that.
+
+Caveats / rollout reality check
+If you set MAQ=0, domain join has to be done by:
+admins, helpdesk with delegated rights or via pre-staged computer accounts.
+
+Check your onboarding flows: MDT/SCCM, Autopilot Hybrid Join, scripts, or imaging tools might rely on user-driven joins.
+
+Fix is easy: delegate "Create Computer Objects" on a specific OU to the right group/service account. Least privilege, targeted OU, done.
+Do this now (quick checklist)
+
+Read current value:
+(Get-ADDomain).ms-DS-MachineAccountQuota
+If it’s >0, set to 0 (see script above).
+
+- Review Domain Computers group memberships. Remove anything spicy.
+- Audit OUs where Domain Computers has write permissions. Remove those too.
+- Delegate computer-join rights properly to a limited group and one OU.
+- Monitor for weird new computer accounts that don’t match your naming/join process.
+
+This one is a quiet banger: turns off a default "feature" that attackers use constantly, and forces domain joins back into a controlled lane. 🔐
+
+
+## ## 🎄 Advent of AD-Hardening #5: Cached Passwords
+
+Quick truth bomb: Domain Controllers don’t need cached logons.
+They are the domain. If a DC is "offline from the domain", you’ve got bigger problems than user convenience (and hopefully have your DSRM-password ready... you have that, right... right?)
+
+Why this matters:
+Cached logons mean Windows stores credential material locally (DCC/MSCache hashes). If an attacker ever lands on a DC, those cached creds are a tasty offline-cracking bonus.
+
+On laptops this is useful. On DCs it’s just free loot.
+GPO setting (DC policy):
+Default Domain Controllers Policy → Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options
+Interactive logon: Number of previous logons to cache (in case domain controller is not available)
+✅ Set to: 0
+Result: no domain logons get cached on DCs.
+
+Caveats / don’t shoot your clients... or maybe do:
+This is perfect on DCs.
+Don’t roll this out to workstations/laptops unless you want users to be unable to log in offline.
+For clients, decide consciously: 2–10 cached logons is common depending on your mobility needs, BUT you won't ever use a Domain Admin or other Tier 0 account to log into a client for a quick fix, right?
+
+Do this now:
+- Double-check the GPO is linked to the desired OU.
+- Set the value to 0.
+
+Spot-check a DC afterwards:
+- Registry value should align to 0 cached logons.
+- If you want to harden clients too, create a separate GPO with a sensible cached logon count.
+
+Small setting, solid win: less credential residue on your crown jewels. 🔐
+
+What do you think: Cached logons on clients = 0 or nah?
+
+
+## 🎄 Advent of AD-Hardening #6: Unconstrained Delegation
+
+Unconstrained delegation is basically Active Directory saying:
+"Sure, this machine can hold onto other users' Kerberos tickets for later."
+
+Which translates to attacker-speak: "Steal tickets from this box and become whoever logged in."
+
+Yeah… no thanks.
+
+Why this matters (super short):
+If a server is set to unconstrained delegation and a privileged user logs onto it (interactive, RDP, service hop), their TGT can be cached there. Compromise that server and you can pull those tickets and impersonate them across the domain. It’s a classic "one box falls → whole domain slides" setup.
+OR: A box/account get's compromised and can be used to ask for other users' tickets.
+
+What to do
+1) Remove unconstrained delegation from computers
+Where:
+AD Users and Computers → Computer Properties → Delegation tab
+Make sure "Trust this computer for delegation to any service (Kerberos only)" is NOT enabled.
+
+Quick hunt (PowerShell):
+Get-ADComputer -Filter {TrustedForDelegation -eq $true} -Properties TrustedForDelegation |
+Select Name, DistinguishedName
+
+Anything returned here is a candidate for cleanup.
+
+2) Mark privileged users as "sensitive and cannot be delegated"
+
+Where:
+ AD Users and Computers → User Properties → Account tab
+Enable: "Account is sensitive and cannot be delegated"
+
+Do this for:
+- Domain Admins / Enterprise Admins
+- Tier-0 service accounts
+- Admins with server/OU/GPO control
+
+This stops their credentials from being delegated/cached on other boxes.
+
+Unconstrained delegation is one of those old AD leftovers that attackers still farm today. Removing it shrinks the Kerberos attack surface fast. 🔐
+
+
+## 🎄 Advent of AD-Hardening #7: SMB Signing
+
+SMB without signing is basically "trust me bro" file sharing.
+
+Attackers love that, because it enables SMB man-in-the-middle and relay attacks.
+
+Why this matters (attack view):
+If SMB signing isn’t enforced, an attacker on the same network segment can intercept/relay SMB auth and sessions. This is the classic path into NTLM relaying → lateral movement → "why is the DC talking to this random box?"
+
+Signing forces integrity checks, so tampering/relays fail.
+
+GPO settings (client + server):
+Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options
+Microsoft network server: Digitally sign communications (always)
+ ✅ Enabled
+ → Your servers require signing.
+
+Microsoft network client: Digitally sign communications (always)
+ ✅ Enabled
+ → Your clients require signing too.
+
+This combo is what actually closes the door. If only one side enforces, you still get soft edges.
+
+Caveats / rollout reality check:
+Some ancient NAS devices, copiers, old Linux/Samba builds might not support signing properly. They’ll start failing to connect once you enforce.
+Performance impact on modern hardware is basically rounding error. On very old systems it can be noticeable, but that’s a good forcing function to upgrade.
+
+Prioritize this on DCs(the only ones, that have it turned on by default), file servers, and admin jump hosts first if you need a phased rollout.
+
+Do this now (quick checklist):
+- Pilot the GPO on a small OU with typical clients + one file server.
+- Watch for SMB breakage from legacy devices. Fix/replace or isolate them.
+- Roll out to servers first, then clients.
+
+Verify on a server:
+Get-SmbServerConfiguration | Select EnableSecuritySignature, RequireSecuritySignature
+RequireSecuritySignature should be True.
+
+Verify on a client:
+Get-SmbClientConfiguration | Select EnableSecuritySignature, RequireSecuritySignature
+RequireSecuritySignature should be True as well.
+
+SMB signing is one of those "boring but lethal" defenses: no fireworks, just removes an entire relay/MITM lane from the attacker playbook. 🔐
+
+
+## 🎄 Advent of AD-Hardening #8: Kerberos: Prefer AES, kill RC4
+
+Kerberos is your crown-jewel auth protocol. Letting it fall back to RC4 is like locking your front door with a decent key… but leaving a floppy-disk-era spare under the mat.
+
+Why this matters:
+RC4 (Kerberos "etype 0x17") is legacy crypto. It enables downgrade paths and makes certain ticket attacks a lot easier. Forcing AES pushes everything onto modern, stronger Kerberos encryption.
+
+GPO: Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options → Network security: Configure encryption types allowed for Kerberos
+✅ Set to AES only
+AES128_HMAC_SHA1
+AES256_HMAC_SHA1
+ …and disable/uncheck RC4 + DES.
+That’s the "prefer AES, kill RC4" switch.
+
+Caveats / rollout reality check
+This one is powerful, but don’t yolo it domain-wide without a quick audit.
+Things that can still rely on RC4:
+- Very old clients/servers (pre-Win7/2008R2, old Linux/Java stacks).
+- Service accounts that were never updated for AES.
+- Accounts with "This account supports Kerberos AES…" not enabled (or keys not generated yet).
+- Old trust relationships / low functional levels.
+
+Also important: AES keys are derived from the password, so if an account didn’t have AES enabled when its password was last set, it might not have AES keys yet.
+
+Do this now (safe checklist)
+- Audit RC4 usage first and look for Kerberos tickets using RC4 in your logs:
+Event ID 4768 / 4769
+Encryption type 0x17 = RC4
+
+If you still see 0x17 a lot, find the sources before enforcing AES-only.
+
+- Enable AES on service/admin accounts
+In ADUC → Account tab for the account:
+ ✅ "This account supports Kerberos AES 128/256 bit encryption"
+
+Force AES key generation
+After enabling AES, reset the password for those accounts (even a controlled "set to same value" reset works).
+This regenerates Kerberos keys, including AES.
+
+Pilot the GPO
+Start with a pilot OU (servers + a few clients), watch for auth failures.
+
+Roll out broad
+Then enforce AES-only domain-wide.
+
+Bonus quick wins
+Prioritize Tier-0 accounts and critical services first.
+If something breaks, it’s usually a legacy client/service account. Fix/upgrade it instead of re-allowing RC4.
+This change doesn’t just harden Kerberos, but also exposes the last bits of legacy tech hiding in your AD. And that’s a gift worth unwrapping. 🎁🔐
+
+
+## 🎄 Advent of AD-Hardening #9: No more WDigest
+
+WDigest is one of those "why is this still a thing?" settings.
+When it’s enabled, Windows may keep cleartext logon credentials in LSASS memory. And that’s basically an engraved invitation for Mimikatz and friends.
+
+Why this matters:
+Attackers who get local admin / SYSTEM on a box often go straight for LSASS.
+
+If WDigest is on, they can pull actual plaintext passwords, not just hashes or tickets. That’s game-over material for lateral movement.
+
+So yeah: Mimikatz must die. At least make it work harder.
+
+GPO: Computer Configuration → Policies → Administrative Templates → MS Security Guide
+WDigest Authentication = Disabled
+(aka UseLogonCredential = Disabled / 0)
+
+This stops LSASS from caching cleartext creds for WDigest.
+
+Caveats / reality check
+On modern Windows versions, WDigest is usually off by default — but I still see it re-enabled in the wild by legacy hardening templates, old software, or “someone followed a 2014 blog post.”
+
+Disabling WDigest is not a silver bullet. You’ll still have NTLM hashes and Kerberos tickets in memory — but removing cleartext makes credential theft a lot less catastrophic.
+
+Risk of breaking stuff is low, but if you have very old Digest-auth edge cases, pilot first.
+
+Do this now:
+- Roll the GPO to a pilot OU (servers + admin endpoints first).
+- Verify the registry value: Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name UseLogonCredential
+→ should be 0 or missing (both mean “off”).
+- Expand rollout domain-wide.
+- Pair with the classics: Credential Guard, LSA protection (RunAsPPL), and admin tiering.
+
+Turning off WDigest is like removing a stack of cash from the table. Attackers can still rob the house, but now they have to actually work for it. 🔐😄
+
+
+## 🎄 Advent of AD-Hardening #10: Credential Guard
+
+If you’ve ever watched LSASS dumping turn into "instant admin buffet", Credential Guard is your bouncer. 
+It isolates secrets in a VBS (virtualization based security, not that scripting thing) container, so even if someone gets local admin, LSASS is way less juicy.
+
+Why this matters:
+Most credential theft on Windows relies on scraping LSASS memory for NTLM hashes, Kerberos tickets, or even cached creds. It's not very OpSec-safe, but if the defences are lacking, it usually works.
+Credential Guard moves those secrets into a protected, virtualized area. 
+
+Result: Mimikatz still runs, but it comes back hungry.
+
+GPO: Computer Configuration → Policies → Administrative Templates → System → Device Guard
+Turn on Virtualization Based Security = Enabled
+
+Under that:
+Credential Guard = Enabled
+If you can, pick UEFI lock
+(means it can’t be disabled by malware later without firmware level change)
+
+Where to roll this out first:
+- Admin workstations and jump hosts
+- High value servers (file servers, app servers with lots of logons)
+
+Then broad client rollout
+- DCs are usually not the first target for CG. Start where admins log in.
+
+Caveats / rollout reality check:
+- Needs VBS capable hardware and firmware (UEFI, virtualization, usually TPM). 
+- Older boxes might not support it.
+- Some legacy credential providers, old VPN clients, or crusty endpoint tools can misbehave. Pilot first.
+- If you rely on old-school auth hacks, CG will expose them fast. That’s annoying for a week, awesome forever.
+
+Do this now:
+- Pilot on a small OU (admin endpoints first).
+- Verify it’s actually running:
+Get-CimInstance -ClassName Win32_DeviceGuard | 
+ Select-Object -ExpandProperty SecurityServicesRunning
+You want to see 1 (Credential Guard) in the list.
+
+Or quick human check:
+- msinfo32 → look for “Virtualization-based Security: Running”
+- Fix any legacy app/VPN issues you hit in pilot.
+- Expand rollout OU by OU.
+- If possible, switch to UEFI lock after you’re confident.
+
+Credential Guard won’t make Windows invincible, but it absolutely makes "dump creds and sprint through AD" a lot harder. And in this game, harder = safer. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #11: Block interactive logon for service accounts
+
+Service accounts are not people. So they shouldn’t be able to log on like people.
+Allowing interactive logon (local or RDP) for service accounts is basically giving attackers a bonus "human-style" credential they can abuse for persistence or lateral movement.
+
+Why this matters:
+If a service account can log on interactively, an attacker who gets the password (or token) can:
+- RDP into servers under that identity
+- Run tools "as the service" without tripping normal admin controls
+- Stash creds in places you don’t expect (profiles, cached logons, LSASS sessions)
+
+Even worse: service accounts often have wide rights because "the app needed it once", so blocking interactive logon reduces blast radius fast.
+
+What to do
+1) Move to Group Managed Service Accounts (gMSA)
+Where: ADUC → create gMSAs
+
+Why gMSAs rock:
+- Auto-rotating long passwords
+- No one knows / types the password
+ -Clean Kerberos usage + SPNs
+ -Kills a lot of “shared static secret” pain
+If you’re still on classic user-based service accounts, this is your upgrade path.
+
+2) Deny interactive logon for service-account groups
+Create a dedicated group for your service accounts (or gMSAs), then deny logon rights via GPO.
+GPO path:
+ Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → User Rights Assignment
+
+Set these for your service-account groups:
+- Deny log on locally
+- Deny log on through Remote Desktop Services
+
+That’s it. Services keep running. Humans can’t "be" the service.
+
+Caveats / don’t break prod
+- Do NOT touch "Log on as a service" for these accounts.
+You’re blocking interactive logon, not service execution.
+- Test on a pilot OU first, especially if you have legacy apps that do odd things.
+- Make sure admins are not accidentally members of your service-account group (deny wins over allow).
+- gMSAs aren't for everyone - there are a bunch of apps, that can't handle their service account being a gMSA.
+
+Do this now:
+- Inventory service accounts → group them (one or more "svc-accounts" groups).
+- Migrate the worst offenders to gMSA first.
+- Apply the deny-logon GPO to your server OUs.
+Verify nothing needed interactive logon (it shouldn’t).
+- Expand rollout
+
+This is one of those hardenings that feels "too simple"… until you see how many breaches start with a service account being used like a human. Not anymore. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #12: Saved WinRM Creds
+
+WinRM is awesome for admin automation… and a sneaky place to leak creds if you let it cache RunAs logons.
+
+If an attacker compromises a box, any stored WinRM RunAs credentials are basically free lateral-movement coupons.
+
+Why this matters:
+Some tools and scripts use RunAs with WinRM to hop onto other machines. If Windows is allowed to store those credentials, they can end up retrievable from the system later. That’s the opposite of what we want in an admin channel.
+
+GPO: Computer Configuration → Policies → Administrative Templates → Windows Components → Windows Remote Management (WinRM) → WinRM Service
+Disallow WinRM from storing RunAs credentials
+ ✅ Enabled
+Result: WinRM won’t persist RunAs creds on the machine.
+
+Caveats / reality check
+This doesn’t break WinRM itself. It just prevents credential caching.
+If you have scripts that expect stored RunAs creds to survive reboots (rare, and kinda scary), they might need a rethink. Use gMSAs, JEA, or proper secret vaulting instead.
+
+Do this now:
+- Enable the policy in a pilot OU (admin endpoints + servers where WinRM is used).
+- Review automation that uses RunAs: move to gMSA where possible
+or pull creds from a vault instead of caching
+- Roll out broadly once pilot is clean.
+
+WinRM should be a secure highway for admin tasks, not a credential parking lot. This setting keeps it that way. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #13: NTLMv2 only
+
+NTLM isn’t dead everywhere yet, but NTLMv1 absolutely should be.
+
+So today’s move is simple: if NTLM must exist in your env, make it NTLMv2-only. No downgrade, no legacy fallback.
+
+Why this matters:
+Attackers love old NTLM because it’s easier to crack, relay, and abuse for lateral movement.
+
+Forcing NTLMv2 removes the weakest modes and blocks a bunch of easy "pass-the-hash / relay-lite" paths.
+
+GPO: Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options → Network security
+Network security: LAN Manager authentication level
+ ✅ Set to: "Send NTLMv2 response only. Refuse LM & NTLM"
+(That’s the "no more LM/NTLMv1, ever" switch.)
+
+Caveats / rollout reality check
+- Legacy devices and old software can still try LM/NTLMv1: old NAS, printers, scanners, random embedded stuff. They’ll start failing. Good. Burn them.
+- Don’t panic — that failure list is basically your legacy cleanup roadmap.
+- If you’re unsure, pair this with NTLM auditing first, then enforce once you know what breaks.
+
+Do this now:
+- Roll out to a pilot OU first (mix of clients + one/two servers).
+- Watch for failed auth from legacy devices. Fix/replace/isolate them.
+- Expand domain-wide once pilot is clean.
+
+Bonus: keep an eye on NTLM usage and push anything that can to Kerberos.
+This is the "minimum bar" for NTLM survival. If NTLM is still around in your AD, it better be v2-only. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #14: Disable Basic Auth for WinRM
+
+WinRM is meant to be your safe remote-admin tunnel.
+
+Basic Auth turns it into "username + password in a trench coat". 
+Even with TLS, it’s still the weakest WinRM auth option and a favorite for password spraying and credential replay.
+
+Why this matters:
+Basic Auth sends creds in a trivially reversible form (basically base64). If someone can intercept traffic or trick a client into talking to a rogue endpoint, Basic makes that way easier. Disabling it forces stronger methods like Kerberos/Negotiate or certificate auth.
+
+GPO: Computer Configuration → Policies → Administrative Templates → Windows Components → Windows Remote Management (WinRM) → WinRM Service
+Allow Basic authentication = Disabled
+
+Result: WinRM refuses Basic logons.
+
+Caveats / rollout reality check
+Some old scripts/tools might still be calling WinRM with -Authentication Basic. Those will fail after this. Good: now you can fix them properly.
+
+Make sure your environment supports a strong alternative:
+Kerberos/Negotiate for domain-joined management
+HTTPS + certificates for non-domain or cross-forest cases
+
+If a tool needs "prompted creds", use Negotiate/Kerberos over HTTPS, not Basic.
+
+Do this now:
+- Pilot the GPO on admin endpoints + a couple of servers first.
+- Hunt for Basic usage:
+winrm get winrm/config/service
+Look at Auth → Basic should be false after rollout.
+- Update any automation to use:
+default Kerberos (PowerShell Remoting does this automatically), or
+certificate-based WinRM if needed.
+- Roll out broadly once pilot is clean.
+
+Basic Auth in WinRM is like eggnog left open on the radiator: it will go bad. Turn it off and keep your remoting channel grown-up. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #15: Block anonymous enumeration
+
+Anonymous (null session) enumeration is like letting strangers walk into your org lobby and read the employee directory, org chart, and floor plan… without even showing a badge. 
+Commodity tools love this because it makes recon stupidly easy.
+
+Why this matters:
+If attackers can enumerate users, groups, shares, or SIDs without authenticating, they can:
+- build a clean target list for password spraying
+- map file servers and juicy shares
+- speed-run AD recon before you even see a login attempt
+
+Blocking anon enum doesn’t stop all recon, but it forces attackers to show credentials early. That’s a win.
+
+GPO: Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → Security Options
+Set these:
+Network access: Do not allow anonymous enumeration of SAM accounts
+ ✅ Enabled
+Network access: Do not allow anonymous enumeration of SAM accounts and shares
+ ✅ Enabled
+Network access: Allow anonymous SID/Name translation
+ ❌ Disabled
+Extra hardening (same area):
+ 4) Network security: Allow LocalSystem NULL session fallback
+ ❌ Disabled
+
+Caveats / rollout reality check
+- Some ancient apps or appliances might still use null sessions for discovery. If something breaks, that’s a sign it’s living in the past.
+- Pilot first on a representative OU (file servers + a few member servers), then roll domain-wide.
+- DCs and file servers benefit the most.
+
+Do this now:
+- Enable the four settings in a pilot GPO.
+- Test common workflows: legacy apps, file share access, printer discovery, etc.
+- If something relies on anon access, fix it by using proper service accounts or modern protocols.
+- Roll out broadly and watch recon noise drop.
+
+Blocking anonymous enumeration is one of those "boring basic controls" that quietly ruins an attacker’s day. They can still scout, but now they have to knock first. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #16: Reversible Encryption
+
+"Store passwords using reversible encryption" is AD’s polite way of saying:
+"Let’s keep passwords basically in plaintext"
+
+There are a few dusty legacy cases where this was once needed. In 2025, it’s almost always a security own-goal.
+
+Why this matters:
+If reversible encryption is enabled, AD can store a form of the password that can be recovered, not just hashed.
+
+So if an attacker gets hold of those secrets (think DC compromise, backup theft, or rogue admin), they’re not cracking hashes anymore, they’re reading passwords.
+
+GPO: Computer Configuration → Policies → Windows Settings → Security Settings → Account Policies → Password Policy
+Store passwords using reversible encryption = Disabled
+
+Caveats / legacy reality check
+Some very old auth methods (CHAP, Digest, certain IAS/RADIUS relics) required reversible encryption.
+If anything still depends on it, that’s a giant red "please modernize me" sticker.
+
+Better fix the dependency than keep plaintext-equivalent storage alive.
+
+Do this now:
+- Make sure the domain password policy has it Disabled.
+- Hunt for accounts that explicitly require reversible encryption:
+Get-ADUser -LDAPFilter "(userAccountControl:1.2.840.113556.1.4.803:=128)" `
+ -Properties userAccountControl | Select Name, SamAccountName
+If this returns users, figure out why they were set that way.
+- Kill the legacy requirement or move it to a safer auth flow.
+- Re-test the affected apps, then remove the flag.
+
+This is one of those settings that should be "off forever unless you’re doing archaeology." 
+Turning it off keeps AD from becoming a password diary. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #17: Ban all the RMMs
+RMM tools (Remote Monitoring & Management) are legit for IT… and absolute gold for attackers. Why? They’re already trusted remote control, often MFA-less, and they blend in like a hoodie at a hacker con. If your org doesn’t explicitly use a given RMM, it shouldn’t be able to phone home.
+
+Why this matters:
+Commodity intrusions love off-the-shelf RMMs (AnyDesk, ScreenConnect, TeamViewer, Atera, etc.). They’re perfect for persistence and lateral movement without dropping noisy malware. If you don’t block them, you’re basically letting attackers rent your admin channel.
+
+The play: allowlist the ones you use, block everything else
+1) Define your approved RMMs
+Make a short allowlist. Example:
+
+IT uses NoMachine and Ivanti? Cool.
+Everything else gets treated as hostile.
+
+2) Detect unapproved RMM traffic in Microsoft Defender for Endpoint (MDE)
+Get the MDE KQL from lolrmms[.]com, drop into Advanced Hunting and schedule an alert:
+
+What you get: any device talking to known RMM domains that are not on your allowlist.
+
+3) Detect RMM usage in Splunk
+If you’re on Splunk, this gives you a nice "who is using remote access software" view:
+
+| tstats `security_content_summariesonly` count min(_time) as firstTime max(_time) as lastTime values(All_Traffic.dest_port) as dest_port latest(user) as user from datamodel=Network_Traffic by All_Traffic.src All_Traffic.dest, All_Traffic.app 
+| `drop_dm_object_name("All_Traffic")` 
+| `security_content_ctime(firstTime)` 
+| `security_content_ctime(lastTime)` 
+| lookup remote_access_software remote_appid AS app OUTPUT isutility, description as signature, comment_reference as desc, category 
+| search isutility = True 
+| `remote_access_software_usage_exceptions` 
+| `detect_remote_access_software_usage_traffic_filter`
+
+4) Block the rest at the edge
+Take the domain list from lolrmm.io / LOLRMM and:
+- Block all RMM domains you don’t use (DNS filter, proxy, firewall)
+if you’re strict: block everything except your allowlist
+
+5) Stop installs locally
+Because blocking egress is great, but prevention is better:
+AppLocker / WDAC allowlist for RMM binaries
+remove local admin rights so users can’t "just install AnyDesk real quick"
+alert on new services/drivers typical for RMM agents
+
+Quick checklist to run this week:
+- Inventory approved RMM tools + domains. Keep the list short.
+- Deploy the MDE KQL alert.
+- Add the Splunk detection if you have it.
+- Block non-approved RMM domains org-wide.
+- Enforce app allowlisting to prevent new RMM installs.
+- Review hits weekly and trim your allowlist even further.
+
+RMMs are like chainsaws: awesome when you’re the one holding them, catastrophic when you’re not. So… keep your chainsaws, lock the shed for the rest. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #18: Disable SMBv1
+
+Com ooooon... SMBv1 is the floppy-disk of file sharing. It’s ancient, insecure, and still one of the easiest ways for attackers to move fast once they’re inside (hello EternalBlue/WannaCry era). If it’s still enabled anywhere, it’s a risk you don’t need.
+
+Why this matters:
+SMBv1 has no modern security features and a long history of wormable exploits. Leaving it on is basically keeping a “legacy backdoor” for both malware and lateral movement.
+
+GPO (Registry Preferences) for server + client:
+Computer Configuration → Preferences → Windows Settings → Registry
+1) Disable SMBv1 Server
+Create a new registry item:
+Action: Update (or Create)
+Hive: HKEY_LOCAL_MACHINE
+Key Path: SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+Value name: SMB1
+Value type: REG_DWORD
+Value data: 0
+✅ Result: the machine won’t offer SMBv1 anymore.
+
+2) Disable SMBv1 Client
+Create two registry items:
+a) Disable MRxSMB10 driver
+Action: Update
+Hive: HKEY_LOCAL_MACHINE
+Key Path: SYSTEM\CurrentControlSet\Services\mrxsmb10
+Value name: Start
+Value type: REG_DWORD
+Value data: 4
+b) Remove dependency from LanmanWorkstation
+Action: Replace
+Hive: HKEY_LOCAL_MACHINE
+Key Path: SYSTEM\CurrentControlSet\Services\LanmanWorkstation
+Value name: DependOnService
+Value type: REG_MULTI_SZ
+Value data (one per line):
+Bowser
+MRxSmb20
+NSI
+✅ Result: the machine won’t use SMBv1 even if a server tries.
+
+Caveats / rollout reality check
+Some truly old NAS boxes, printers, scanners, or embedded gear might still speak SMBv1. They will break.
+That’s not a reason to keep SMBv1 - oh no no - it’s a reason to upgrade/replace/isolate those devices.
+
+Do this now:
+- Pilot on a server OU + a mixed client OU.
+- Watch logs/helpdesk for "can’t connect to share" cases → identify legacy devices.
+- Fix/replace or shove them into a quarantined VLAN with a modern SMB proxy.
+- Roll out broadly once clean.
+
+Disabling SMBv1 is a classic "easy win": low effort, huge reduction in attack surface. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #19: Rotate the krbtgt password
+
+It’s not fun, but someone’s gotta do it. Rotating krbtgt is one of the few AD tasks that directly nukes old Kerberos golden tickets and resets trust in your domain’s ticket-signing key.
+
+Why it matters:
+If an attacker ever got the krbtgt hash, they can mint Kerberos tickets basically forever. Rotating the password invalidates those tickets. That’s the whole game.
+
+How to do it:
+- Reset krbtgt once
+- GUI in ADUC is totally fine for most orgs.
+- Or use a script if you like living dangerously and reading 2000 lines of PowerShell.
+- Wait (like a day) for replication to be 100% clean
+- Check replication health/logs.
+- Make sure every DC has the new krbtgt version.
+- Reset krbtgt a second time
+
+This is the important part.
+The first reset creates a new key but old tickets might still validate.
+The second reset fully kicks out anything signed with the previous key.
+
+Do this now:
+- Verify replication is healthy before reset #1.
+- Reset #1.
+- Confirm replication to all DCs (no errors, no lag).
+- Reset #2.
+- Keep an eye on Kerberos/auth noise afterward (should be quiet if replication was clean).
+
+If you’ve never done this: schedule it, do it calmly, and don’t skip the replication check between resets. Boring security chores are still security. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #20: Kerberos Armoring (FAST)
+
+Kerberos Armoring (aka FAST) is like giving Kerberos pre-auth a bulletproof vest. It wraps the pre-auth exchange in an armored tunnel, which makes pre-auth attacks and downgrade games way harder. 
+Less "steal and replay", more "nice try, punk" ;)
+
+Why this matters:
+Without armoring, attackers can mess with or abuse pre-auth flows (think offline guessing and some nasty edge-cases). FAST protects those steps by securing the channel itself.
+
+Heads-up on compatibility:
+Kerberos Armoring is supported starting with:
+- Windows Server 2012 DCs
+- Windows 8 / Server 2012 era clients and newer
+
+If you force armoring and still have Win7 or old Linux boxes around, authentication might break. So… don’t flip the "strict mode" switch blindly.
+
+GPO: Computer Configuration → Administrative Templates → System → KDC
+Enable:
+"KDC support for claims, compound authentication and Kerberos armoring"
+Set to at least:
+ ✅ Supported
+That means: clients that can do FAST will use it, others still work normally.
+Best-practice target (once clients support it):
+ ✅ "Fail authentication requests when Kerberos armoring is not available"
+ This is the safest mode, but only after you’ve confirmed your client fleet is FAST-capable.
+
+Do this now:
+- Set the policy to Supported first.
+- Watch for any auth weirdness (legacy clients will reveal themselves fast).
+- Clean up / upgrade the holdouts.
+- Only then move to Fail if not available.
+
+Kerberos Armoring is a quiet hardening win: not flashy, but it shuts down a whole category of pre-auth abuse. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #21: Deploy LAPS - it’s not that hard
+
+Shared local admin passwords are one of the easiest lateral-movement highways in AD. One workstation pops, attacker dumps the local admin hash, and suddenly half your fleet is a domino line.
+
+LAPS fixes that.
+Every machine gets a unique, random, auto-rotated local admin password stored in AD (and readable only by the right people). So "pass-the-local-admin" just dies.
+
+What to do (practical + fast):
+Pick your flavor
+- Microsoft LAPS (new) on Win10/11 + Server 2019/2022+
+- Legacy LAPS if you’ve got older clients.
+- Enable + configure via GPO
+- Turn on LAPS management for your local admin account
+- Set rotation interval (e.g., 7–30 days)
+- Set password length/complexity
+- Optional: backup to AD (default) or Entra ID if you’re hybrid.
+- Lock down who can read passwords
+- Only Helpdesk / Tier-0 admins should have read rights.
+- Everyone else: Nooope
+
+Rollout
+- Start with a pilot OU, then expand.
+- Verify a few laptops/servers rotate as expected.
+
+Quick sanity checks:
+New LAPS retrieval:
+Get-LapsADPassword -Identity PC-NAME
+
+Legacy LAPS retrieval:
+Get-ADComputer PC-NAME -Properties ms-Mcs-AdmPwd
+
+Caveats (so you don’t get surprised):
+- If you have multiple local admin accounts, decide which one LAPS owns.
+- Make sure your helpdesk process is ready (who can fetch passwords, how they log access).
+- Don’t forget servers. They’re often the juiciest lateral targets.
+- Deploying LAPS is one of those rare defenses that’s simple, cheap, and brutally effective. Local admin creds stop being a shared secret, and attackers lose a favorite autopilot move. 🔐🎅
+
+
+## 🎄 Advent of AD-Hardening #22: Kerberoasting
+
+Kerberoasting is one of those AD classics that’s still wildly effective:
+If a user account has an SPN, attackers can request its Kerberos service ticket and crack it offline. Weak service account password = free DA in slow motion.
+
+Here’s how to make it a pain:
+
+1) Minimize SPNs
+- Every SPN is a roastable target.
+- Audit SPNs regularly and delete the ones nobody needs anymore.
+- Especially old app/service accounts that survived three migrations.
+
+2) Use gMSAs for SPN accounts
+Best fix. gMSAs give you: auto-rotated, long, random passwords that humans never see.
+
+If gMSA isn’t possible yet:
+- Set 30+ character passwords
+- Unique + unpredictable
+- Managed/rotated (not “SvcApp2021!” forever)
+
+3) Least privilege, always
+- SPN accounts should do one job, nothing more.
+- No membership in privileged groups (Domain Admins, Server Admins, etc.)
+- No broad ACL write rights
+- Avoid "works if we make it admin" as a life strategy
+
+Quick win checklist:
+- Run an SPN inventory, kill the zombies.
+- Migrate high-value SPN accounts to gMSA first.
+- For remaining ones: 30+ char random + rotation policy.
+- Strip rights until the app screams, then give back the minimum.
+
+Kerberoasting doesn’t die by magic. It dies by boring hygiene you control. 🔐🎅
+
+
+# 🎄 Advent of AD-Hardening #23: AS-REP Roasting
+
+AS-REP roasting is Kerberoasting’s sneaky little cousin. If a user has "Do not require Kerberos pre-authentication" set, attackers can request an AS-REP for that account and crack it offline. 
+Weak password = instant credential win.
+Your mission: pre-auth stays ON.
+
+What to do:
+- Ensure all users require Kerberos pre-auth
+- In ADUC → user properties → Account tab
+- Make sure "Do not require Kerberos preauthentication" is UNchecked.
+- Audit for offenders
+
+Quick PowerShell to find accounts vulnerable to AS-REP roasting:
+Get-ADUser -LDAPFilter "(userAccountControl:1.2.840.113556.1.4.803:=4194304)" `
+ -Properties userAccountControl | Select Name, SamAccountName
+
+If this returns users, you’ve got roastable targets.
+
+If you must exempt an account (rare legacy cases):
+- Least privilege only (no Domain Admins, no high-trust groups)
+- 30+ character random password, unique + rotated
+- Treat it like a hazardous material container.
+
+Quick win checklist:
+- Run the audit, fix everyone you can.
+- For true legacy exceptions: lock privileges down hard and go long on passwords.
+- Re-audit regularly so the flag doesn’t “mysteriously” come back.
+
+AS-REP roasting only works when pre-auth is off. So keep it on and make attackers eat dry toast. 🔐🎅
+
+
+# 🎄 Advent of AD-Hardening #24: Harden UNC Paths
+
+Last door on the calendar, and it’s a big one.
+
+SYSVOL and NETLOGON are how your DCs deliver GPOs, scripts, and basically "how AD talks to clients". 
+If an attacker can MITM or tamper with those shares, you’re in "domain-wide chaos" territory.
+
+Why this matters:
+Hardening UNC paths forces mutual authentication + integrity when clients access SYSVOL/NETLOGON. That means no silent downgrade, no tampered policies, and no shady relay games on your most sensitive shares.
+
+GPO: Computer Configuration → Policies → Administrative Templates → Network → Network Provider → Hardened UNC Paths
+Set these entries:
+\\*\SYSVOL
+ RequireMutualAuthentication=1, RequestIntegrity=1
+\\*\NETLOGON
+ RequireMutualAuthentication=1, RequestIntegrity=1
+
+Caveats / rollout reality check:
+Very old clients (think pre-Win8 / older Samba) might choke on this.
+So pilot first, especially if you still have legacy boxes hiding in closets.
+
+Do this now:
+- Add both hardened UNC entries in a pilot GPO.
+- Link to a test OU with mixed clients.
+- Watch for access/auth errors to SYSVOL/NETLOGON.
+- Fix or upgrade the stragglers.
+- Roll out domain-wide.
+
+That’s the Advent wrapped. You’ve just tightened the bolts on one of the most critical trust paths in AD. Merry Christmas, and may your SYSVOL stay un-tampered. 🔐🎅
+And for those who don't celebrate: Happy random day in December 🥳 
